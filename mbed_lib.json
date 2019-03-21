@@ -1,5 +1,5 @@
 {
-    "name": "esp8266",
+    "name": "wizfi360",
     "config": {
         "tx": {
             "help": "TX pin for serial connection. D1 assumed if Arduino Form Factor, needs to be set/overwritten otherwise",

@@ -1,4 +1,6 @@
-/* ESP8266Interface Example
+/* This WizFi360 Driver referred to ESP8266 Driver in mbed-os
+ *
+ * ESP8266Interface Example
  * Copyright (c) 2015 ARM Limited
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,8 +16,8 @@
  * limitations under the License.
  */
 
-#ifndef ESP8266_H
-#define ESP8266_H
+#ifndef WIZFI360_H
+#define WIZFI360_H
 
 #if DEVICE_SERIAL && defined(MBED_CONF_EVENTS_PRESENT) && defined(MBED_CONF_NSAPI_PRESENT) && defined(MBED_CONF_RTOS_PRESENT)
 #include <stdint.h>
@@ -29,41 +31,41 @@
 #include "platform/mbed_error.h"
 #include "rtos/Mutex.h"
 
-// Various timeouts for different ESP8266 operations
-#ifndef ESP8266_CONNECT_TIMEOUT
-#define ESP8266_CONNECT_TIMEOUT 15000
+// Various timeouts for different WizFi360 operations
+#ifndef WIZFI360_CONNECT_TIMEOUT
+#define WIZFI360_CONNECT_TIMEOUT 15000
 #endif
-#ifndef ESP8266_SEND_TIMEOUT
-#define ESP8266_SEND_TIMEOUT    2000
+#ifndef WIZFI360_SEND_TIMEOUT
+#define WIZFI360_SEND_TIMEOUT    2000
 #endif
-#ifndef ESP8266_RECV_TIMEOUT
-#define ESP8266_RECV_TIMEOUT    2000
+#ifndef WIZFI360_RECV_TIMEOUT
+#define WIZFI360_RECV_TIMEOUT    2000
 #endif
-#ifndef ESP8266_MISC_TIMEOUT
-#define ESP8266_MISC_TIMEOUT    2000
+#ifndef WIZFI360_MISC_TIMEOUT
+#define WIZFI360_MISC_TIMEOUT    2000
 #endif
 
 // Firmware version
-#define ESP8266_SDK_VERSION 2000000
-#define ESP8266_SDK_VERSION_MAJOR ESP8266_SDK_VERSION/1000000
+#define WIZFI360_SDK_VERSION 2000000
+#define WIZFI360_SDK_VERSION_MAJOR WIZFI360_SDK_VERSION/1000000
 
-#define ESP8266_AT_VERSION 1000000
-#define ESP8266_AT_VERSION_MAJOR ESP8266_AT_VERSION/1000000
-#define ESP8266_AT_VERSION_TCP_PASSIVE_MODE 1070000
-#define ESP8266_AT_VERSION_WIFI_SCAN_CHANGE 1060000
+#define WIZFI360_AT_VERSION 1000000
+#define WIZFI360_AT_VERSION_MAJOR WIZFI360_AT_VERSION/1000000
+#define WIZFI360_AT_VERSION_TCP_PASSIVE_MODE 1070000
+#define WIZFI360_AT_VERSION_WIFI_SCAN_CHANGE 1060000
 
 #define FW_AT_LEAST_VERSION(MAJOR,MINOR,PATCH,NUSED/*Not used*/,REF) \
     (((MAJOR)*1000000+(MINOR)*10000+(PATCH)*100) >= REF ? true : false)
 
-/** ESP8266Interface class.
-    This is an interface to a ESP8266 radio.
+/** WizFi360Interface class.
+    This is an interface to a WizFi360 radio.
  */
-class ESP8266 {
+class WizFi360 {
 public:
-    ESP8266(PinName tx, PinName rx, bool debug = false, PinName rts = NC, PinName cts = NC);
+    WizFi360(PinName tx, PinName rx, bool debug = false, PinName rts = NC, PinName cts = NC);
 
     /**
-    * ESP8266 firmware SDK version
+    * WizFi360 firmware SDK version
     *
     * @param major Major version number
     * @param minor Minor version number
@@ -77,7 +79,7 @@ public:
     };
 
     /**
-    * ESP8266 firmware AT version
+    * WizFi360 firmware AT version
     *
     * @param major Major version number
     * @param minor Minor version number
@@ -91,7 +93,7 @@ public:
     };
 
     /**
-    * Check AT command interface of ESP8266
+    * Check AT command interface of WizFi360
     *
     * @return true if ready to respond on AT commands
     */
@@ -119,17 +121,17 @@ public:
     struct fw_at_version at_version(void);
 
     /**
-    * Startup the ESP8266
+    * Startup the WizFi360
     *
     * @param mode mode of WIFI 1-client, 2-host, 3-both
-    * @return true only if ESP8266 was setup correctly
+    * @return true only if WizFi360 was setup correctly
     */
     bool startup(int mode);
 
     /**
-    * Reset ESP8266
+    * Reset WizFi360
     *
-    * @return true only if ESP8266 resets successfully
+    * @return true only if WizFi360 resets successfully
     */
     bool reset(void);
 
@@ -138,12 +140,12 @@ public:
     *
     * @param enabled DHCP enabled when true
     * @param mode mode of DHCP 0-softAP, 1-station, 2-both
-    * @return true only if ESP8266 enables/disables DHCP successfully
+    * @return true only if WizFi360 enables/disables DHCP successfully
     */
     bool dhcp(bool enabled, int mode);
 
     /**
-    * Connect ESP8266 to AP
+    * Connect WizFi360 to AP
     *
     * @param ap the name of the AP
     * @param passPhrase the password of AP
@@ -152,21 +154,21 @@ public:
     nsapi_error_t connect(const char *ap, const char *passPhrase);
 
     /**
-    * Disconnect ESP8266 from AP
+    * Disconnect WizFi360 from AP
     *
-    * @return true only if ESP8266 is disconnected successfully
+    * @return true only if WizFi360 is disconnected successfully
     */
     bool disconnect(void);
 
     /**
-    * Get the IP address of ESP8266
+    * Get the IP address of WizFi360
     *
     * @return null-teriminated IP address or null if no IP address is assigned
     */
     const char *ip_addr(void);
 
     /**
-    * Get the MAC address of ESP8266
+    * Get the MAC address of WizFi360
     *
     * @return null-terminated MAC address or null if no MAC address is assigned
     */
@@ -253,7 +255,7 @@ public:
     * @param amount number of bytes to be received
     * @return the number of bytes received
     */
-    int32_t recv_udp(int id, void *data, uint32_t amount, uint32_t timeout = ESP8266_RECV_TIMEOUT);
+    int32_t recv_udp(int id, void *data, uint32_t amount, uint32_t timeout = WIZFI360_RECV_TIMEOUT);
 
     /**
     * Receives stream data from an open TCP socket
@@ -263,7 +265,7 @@ public:
     * @param amount number of bytes to be received
     * @return the number of bytes received
     */
-    int32_t recv_tcp(int id, void *data, uint32_t amount, uint32_t timeout = ESP8266_RECV_TIMEOUT);
+    int32_t recv_tcp(int id, void *data, uint32_t amount, uint32_t timeout = WIZFI360_RECV_TIMEOUT);
 
     /**
     * Closes a socket
@@ -278,7 +280,7 @@ public:
     *
     * @param timeout_ms timeout of the connection
     */
-    void set_timeout(uint32_t timeout_ms = ESP8266_MISC_TIMEOUT);
+    void set_timeout(uint32_t timeout_ms = WIZFI360_MISC_TIMEOUT);
 
     /**
     * Checks if data is available
@@ -341,14 +343,14 @@ public:
     nsapi_connection_status_t connection_status() const;
 
     /**
-     * Start board's and ESP8266's UART flow control
+     * Start board's and WizFi360's UART flow control
      *
      * @return true if started
      */
     bool start_uart_hw_flow_ctrl();
 
     /**
-     * Stop board's and ESP8266's UART flow control
+     * Stop board's and WizFi360's UART flow control
      *
      * @return true if started
      */
@@ -463,7 +465,7 @@ private:
 
     // Connection state reporting
     nsapi_connection_status_t _conn_status;
-    mbed::Callback<void()> _conn_stat_cb; // ESP8266Interface registered
+    mbed::Callback<void()> _conn_stat_cb; // WizFi360Interface registered
 };
 #endif
 #endif

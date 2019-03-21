@@ -1,4 +1,6 @@
-/* ESP8266 implementation of NetworkInterfaceAPI
+/* This WizFi360 Driver referred to ESP8266 Driver in mbed-os
+ *
+ * ESP8266 implementation of NetworkInterfaceAPI
  * Copyright (c) 2015 ARM Limited
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,12 +16,12 @@
  * limitations under the License.
  */
 
-#ifndef ESP8266_INTERFACE_H
-#define ESP8266_INTERFACE_H
+#ifndef WIZFI360_INTERFACE_H
+#define WIZFI360_INTERFACE_H
 
 #if DEVICE_SERIAL && defined(MBED_CONF_EVENTS_PRESENT) && defined(MBED_CONF_NSAPI_PRESENT) && defined(MBED_CONF_RTOS_PRESENT)
 #include "drivers/DigitalOut.h"
-#include "ESP8266/ESP8266.h"
+#include "WizFi360/WizFi360.h"
 #include "events/EventQueue.h"
 #include "events/mbed_shared_queues.h"
 #include "features/netsocket/NetworkInterface.h"
@@ -32,42 +34,42 @@
 #include "rtos/ConditionVariable.h"
 #include "rtos/Mutex.h"
 
-#define ESP8266_SOCKET_COUNT 5
+#define WIZFI360_SOCKET_COUNT 5
 
 #ifdef TARGET_FF_ARDUINO
-#ifndef MBED_CONF_ESP8266_TX
-#define MBED_CONF_ESP8266_TX D1
+#ifndef MBED_CONF_WIZFI360_TX
+#define MBED_CONF_WIZFI360_TX D1
 #endif
 
-#ifndef MBED_CONF_ESP8266_RX
-#define MBED_CONF_ESP8266_RX D0
+#ifndef MBED_CONF_WIZFI360_RX
+#define MBED_CONF_WIZFI360_RX D0
 #endif
 #endif /* TARGET_FF_ARDUINO */
 
-/** ESP8266Interface class
- *  Implementation of the NetworkStack for the ESP8266
+/** WizFi360Interface class
+ *  Implementation of the NetworkStack for the WizFi360
  */
-class ESP8266Interface : public NetworkStack, public WiFiInterface {
+class WizFi360Interface : public NetworkStack, public WiFiInterface {
 public:
-#if defined MBED_CONF_ESP8266_TX && defined MBED_CONF_ESP8266_RX
+#if defined MBED_CONF_WIZFI360_TX && defined MBED_CONF_WIZFI360_RX
     /**
-     * @brief ESP8266Interface default constructor
+     * @brief WizFi360Interface default constructor
      *        Will use values defined in mbed_lib.json
      */
-    ESP8266Interface();
+    WizFi360Interface();
 #endif
 
-    /** ESP8266Interface lifetime
+    /** WizFi360Interface lifetime
      * @param tx        TX pin
      * @param rx        RX pin
      * @param debug     Enable debugging
      */
-    ESP8266Interface(PinName tx, PinName rx, bool debug = false, PinName rts = NC, PinName cts = NC, PinName rst = NC);
+    WizFi360Interface(PinName tx, PinName rx, bool debug = false, PinName rts = NC, PinName cts = NC, PinName rst = NC);
 
     /**
-     * @brief ESP8266Interface default destructor
+     * @brief WizFi360Interface default destructor
      */
-    virtual ~ESP8266Interface();
+    virtual ~WizFi360Interface();
 
     /** Start the interface
      *
@@ -196,8 +198,8 @@ public:
      *  on the network. The parameters on the callback are the event type and
      *  event-type dependent reason parameter.
      *
-     *  In ESP8266 the callback will be called when processing OOB-messages via
-     *  AT-parser. Do NOT call any ESP8266Interface -functions or do extensive
+     *  In WizFi360 the callback will be called when processing OOB-messages via
+     *  AT-parser. Do NOT call any WizFi360Interface -functions or do extensive
      *  processing in the callback.
      *
      *  @param status_cb The callback for status changes
@@ -327,7 +329,7 @@ protected:
 
 private:
     // AT layer
-    ESP8266 _esp;
+    WizFi360 _wizfi360;
     void update_conn_state_cb();
 
     // HW reset pin
@@ -343,11 +345,11 @@ private:
 
 
     // Credentials
-    static const int ESP8266_SSID_MAX_LENGTH = 32; /* 32 is what 802.11 defines as longest possible name */
-    char ap_ssid[ESP8266_SSID_MAX_LENGTH + 1]; /* The longest possible name; +1 for the \0 */
-    static const int ESP8266_PASSPHRASE_MAX_LENGTH = 63; /* The longest allowed passphrase */
-    static const int ESP8266_PASSPHRASE_MIN_LENGTH = 8; /* The shortest allowed passphrase */
-    char ap_pass[ESP8266_PASSPHRASE_MAX_LENGTH + 1]; /* The longest possible passphrase; +1 for the \0 */
+    static const int WIZFI360_SSID_MAX_LENGTH = 32; /* 32 is what 802.11 defines as longest possible name */
+    char ap_ssid[WIZFI360_SSID_MAX_LENGTH + 1]; /* The longest possible name; +1 for the \0 */
+    static const int WIZFI360_PASSPHRASE_MAX_LENGTH = 63; /* The longest allowed passphrase */
+    static const int WIZFI360_PASSPHRASE_MIN_LENGTH = 8; /* The shortest allowed passphrase */
+    char ap_pass[WIZFI360_PASSPHRASE_MAX_LENGTH + 1]; /* The longest possible passphrase; +1 for the \0 */
     nsapi_security_t _ap_sec;
 
     bool _if_blocking; // NetworkInterface, blocking or not
@@ -361,7 +363,7 @@ private:
         bool open;
         uint16_t sport;
     };
-    struct _sock_info _sock_i[ESP8266_SOCKET_COUNT];
+    struct _sock_info _sock_i[WIZFI360_SOCKET_COUNT];
 
     // Driver's state
     int _initialized;
@@ -373,7 +375,7 @@ private:
     struct {
         void (*callback)(void *);
         void *data;
-    } _cbs[ESP8266_SOCKET_COUNT];
+    } _cbs[WIZFI360_SOCKET_COUNT];
     void event();
 
     // Connection state reporting to application
