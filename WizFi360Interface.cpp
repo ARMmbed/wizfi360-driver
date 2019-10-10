@@ -1,6 +1,6 @@
-/* This WizFi360 Driver referred to ESP8266 Driver in mbed-os
+/* This WizFi360 Driver referred to WIZFI360 Driver in mbed-os
  *
- * ESP8266 implementation of NetworkInterfaceAPI
+ * WIZFI360 implementation of NetworkInterfaceAPI
  * Copyright (c) 2015 ARM Limited
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-#if DEVICE_SERIAL && defined(MBED_CONF_EVENTS_PRESENT) && defined(MBED_CONF_NSAPI_PRESENT) && defined(MBED_CONF_RTOS_PRESENT)
+#if DEVICE_SERIAL && DEVICE_INTERRUPTIN && defined(MBED_CONF_EVENTS_PRESENT) && defined(MBED_CONF_NSAPI_PRESENT) && defined(MBED_CONF_RTOS_PRESENT)
 
 #include <string.h>
 #include <stdint.h>
@@ -28,9 +28,9 @@
 #include "features/netsocket/nsapi_types.h"
 #include "mbed_trace.h"
 #include "platform/Callback.h"
+#include "platform/mbed_atomic.h"
 #include "platform/mbed_debug.h"
-#include "platform/mbed_wait_api.h"
-#include "Kernel.h"
+#include "rtos/ThisThread.h"
 
 #ifndef MBED_CONF_WIZFI360_DEBUG
 #define MBED_CONF_WIZFI360_DEBUG false
@@ -48,21 +48,27 @@
 #define MBED_CONF_WIZFI360_RST NC
 #endif
 
+#ifndef MBED_CONF_WIZFI360_PWR
+#define MBED_CONF_WIZFI360_PWR NC
+#endif
 #define TRACE_GROUP  "WIZFI" // WizFi360 Interface
 
 using namespace mbed;
+using namespace rtos;
 
 #if defined MBED_CONF_WIZFI360_TX && defined MBED_CONF_WIZFI360_RX
 WizFi360Interface::WizFi360Interface()
     : _wizfi360(MBED_CONF_WIZFI360_TX, MBED_CONF_WIZFI360_RX, MBED_CONF_WIZFI360_DEBUG, MBED_CONF_WIZFI360_RTS, MBED_CONF_WIZFI360_CTS),
       _rst_pin(MBED_CONF_WIZFI360_RST), // Notice that Pin7 CH_EN cannot be left floating if used as reset
+      _pwr_pin(MBED_CONF_WIZFI360_PWR),
       _ap_sec(NSAPI_SECURITY_UNKNOWN),
       _if_blocking(true),
       _if_connected(_cmutex),
       _initialized(false),
+      _connect_retval(NSAPI_ERROR_OK),
       _conn_stat(NSAPI_STATUS_DISCONNECTED),
       _conn_stat_cb(NULL),
-      _global_event_queue(NULL),
+      _global_event_queue(mbed_event_queue()), // Needs to be set before attaching event() to SIGIO
       _oob_event_id(0),
       _connect_event_id(0)
 {
@@ -70,30 +76,35 @@ WizFi360Interface::WizFi360Interface()
     memset(ap_ssid, 0, sizeof(ap_ssid));
     memset(ap_pass, 0, sizeof(ap_pass));
 
+    _ch_info.track_ap = true;
+    strncpy(_ch_info.country_code, MBED_CONF_WIZFI360_COUNTRY_CODE, sizeof(_ch_info.country_code));
+    _ch_info.channel_start = MBED_CONF_WIZFI360_CHANNEL_START;
+    _ch_info.channels = MBED_CONF_WIZFI360_CHANNELS;
     _wizfi360.sigio(this, &WizFi360Interface::event);
     _wizfi360.set_timeout();
-    _wizfi360.attach(this, &WizFi360Interface::update_conn_state_cb);
+    _wizfi360.attach(this, &WizFi360Interface::refresh_conn_state_cb);
 
     for (int i = 0; i < WIZFI360_SOCKET_COUNT; i++) {
         _sock_i[i].open = false;
         _sock_i[i].sport = 0;
     }
 
-    _oob2global_event_queue();
 }
 #endif
 
 // WizFi360Interface implementation
-WizFi360Interface::WizFi360Interface(PinName tx, PinName rx, bool debug, PinName rts, PinName cts, PinName rst)
+WizFi360Interface::WizFi360Interface(PinName tx, PinName rx, bool debug, PinName rts, PinName cts, PinName rst, PinName pwr)
     : _wizfi360(tx, rx, debug, rts, cts),
       _rst_pin(rst),
+      _pwr_pin(pwr),
       _ap_sec(NSAPI_SECURITY_UNKNOWN),
       _if_blocking(true),
       _if_connected(_cmutex),
       _initialized(false),
+      _connect_retval(NSAPI_ERROR_OK),
       _conn_stat(NSAPI_STATUS_DISCONNECTED),
       _conn_stat_cb(NULL),
-      _global_event_queue(NULL),
+      _global_event_queue(mbed_event_queue()), // Needs to be set before attaching event() to SIGIO
       _oob_event_id(0),
       _connect_event_id(0)
 {
@@ -101,16 +112,18 @@ WizFi360Interface::WizFi360Interface(PinName tx, PinName rx, bool debug, PinName
     memset(ap_ssid, 0, sizeof(ap_ssid));
     memset(ap_pass, 0, sizeof(ap_pass));
 
+    _ch_info.track_ap = true;
+    strncpy(_ch_info.country_code, MBED_CONF_WIZFI360_COUNTRY_CODE, sizeof(_ch_info.country_code));
+    _ch_info.channel_start = MBED_CONF_WIZFI360_CHANNEL_START;
+    _ch_info.channels = MBED_CONF_WIZFI360_CHANNELS;
     _wizfi360.sigio(this, &WizFi360Interface::event);
     _wizfi360.set_timeout();
-    _wizfi360.attach(this, &WizFi360Interface::update_conn_state_cb);
+    _wizfi360.attach(this, &WizFi360Interface::refresh_conn_state_cb);
 
     for (int i = 0; i < WIZFI360_SOCKET_COUNT; i++) {
         _sock_i[i].open = false;
         _sock_i[i].sport = 0;
     }
-
-    _oob2global_event_queue();
 }
 
 WizFi360Interface::~WizFi360Interface()
@@ -127,6 +140,8 @@ WizFi360Interface::~WizFi360Interface()
 
     // Power down the modem
     _rst_pin.rst_assert();
+    // Power off the modem
+    _pwr_pin.power_off();
 }
 
 WizFi360Interface::ResetPin::ResetPin(PinName rst_pin) : _rst_pin(mbed::DigitalOut(rst_pin, 1))
@@ -155,6 +170,33 @@ bool WizFi360Interface::ResetPin::is_connected()
     return _rst_pin.is_connected();
 }
 
+WizFi360Interface::PowerPin::PowerPin(PinName pwr_pin) : _pwr_pin(mbed::DigitalOut(pwr_pin, !MBED_CONF_WIZFI360_POWER_ON_POLARITY))
+{
+}
+
+void WizFi360Interface::PowerPin::power_on()
+{
+    if (_pwr_pin.is_connected()) {
+        _pwr_pin = MBED_CONF_WIZFI360_POWER_ON_POLARITY;
+        tr_debug("HW power-on");
+        ThisThread::sleep_for(MBED_CONF_WIZFI360_POWER_ON_TIME_MS);
+    }
+}
+
+void WizFi360Interface::PowerPin::power_off()
+{
+    if (_pwr_pin.is_connected()) {
+        _pwr_pin = !MBED_CONF_WIZFI360_POWER_ON_POLARITY;
+        tr_debug("HW power-off");
+        ThisThread::sleep_for(MBED_CONF_WIZFI360_POWER_OFF_TIME_MS);
+    }
+}
+
+bool WizFi360Interface::PowerPin::is_connected()
+{
+    return _pwr_pin.is_connected();
+}
+
 int WizFi360Interface::connect(const char *ssid, const char *pass, nsapi_security_t security,
                               uint8_t channel)
 {
@@ -170,16 +212,6 @@ int WizFi360Interface::connect(const char *ssid, const char *pass, nsapi_securit
     return connect();
 }
 
-void WizFi360Interface::_oob2global_event_queue()
-{
-    _global_event_queue = mbed_event_queue();
-    _oob_event_id = _global_event_queue->call_every(WIZFI360_RECV_TIMEOUT, callback(this, &WizFi360Interface::proc_oob_evnt));
-
-    if (!_oob_event_id) {
-        MBED_ERROR(MBED_MAKE_ERROR(MBED_MODULE_DRIVER, MBED_ERROR_CODE_ENOMEM), \
-                   "WizFi360::_oob2geq: unable to allocate OOB event");
-    }
-}
 
 void WizFi360Interface::_connect_async()
 {
@@ -189,18 +221,25 @@ void WizFi360Interface::_connect_async()
         _cmutex.unlock();
         return;
     }
-
-    if (_wizfi360.connect(ap_ssid, ap_pass) != NSAPI_ERROR_OK) {
+    _connect_retval = _wizfi360.connect(ap_ssid, ap_pass);
+    int timeleft_ms = WIZFI360_INTERFACE_CONNECT_TIMEOUT_MS - _conn_timer.read_ms();
+    if (_connect_retval == NSAPI_ERROR_OK || _connect_retval == NSAPI_ERROR_AUTH_FAILURE
+            || _connect_retval == NSAPI_ERROR_NO_SSID
+            || ((_if_blocking == true) && (timeleft_ms <= 0))) {
+        _connect_event_id = 0;
+        _conn_timer.stop();
+        if (timeleft_ms <= 0) {
+            _connect_retval = NSAPI_ERROR_CONNECTION_TIMEOUT;
+        }
+        _if_connected.notify_all();
+    } else {
         // Postpone to give other stuff time to run
-        _connect_event_id = _global_event_queue->call_in(WIZFI360_CONNECT_TIMEOUT, callback(this, &WizFi360Interface::_connect_async));
-
+        _connect_event_id = _global_event_queue->call_in(WIZFI360_INTERFACE_CONNECT_INTERVAL_MS,
+                                                         callback(this, &WizFi360Interface::_connect_async));
         if (!_connect_event_id) {
             MBED_ERROR(MBED_MAKE_ERROR(MBED_MODULE_DRIVER, MBED_ERROR_CODE_ENOMEM), \
-                            "_connect_async(): unable to add event to queue");
+                       "WizFi360Interface::_connect_async(): unable to add event to queue. Increase \"events.shared-eventsize\"\n");
         }
-    } else {
-        _connect_event_id = 0;
-        _if_connected.notify_all();
     }
     _cmutex.unlock();
 }
@@ -237,21 +276,30 @@ int WizFi360Interface::connect()
 
     _cmutex.lock();
 
+    _connect_retval = NSAPI_ERROR_NO_CONNECTION;
     MBED_ASSERT(!_connect_event_id);
+    _conn_timer.stop();
+    _conn_timer.reset();
+    _conn_timer.start();
     _connect_event_id = _global_event_queue->call(callback(this, &WizFi360Interface::_connect_async));
 
     if (!_connect_event_id) {
         MBED_ERROR(MBED_MAKE_ERROR(MBED_MODULE_DRIVER, MBED_ERROR_CODE_ENOMEM), \
-                        "connect(): unable to add event to queue");
+                   "connect(): unable to add event to queue. Increase \"events.shared-eventsize\"\n");
     }
 
-    while (_if_blocking && (_conn_status_to_error() != NSAPI_ERROR_IS_CONNECTED)) {
+    while (_if_blocking && (_conn_status_to_error() != NSAPI_ERROR_IS_CONNECTED)
+            && (_connect_retval == NSAPI_ERROR_NO_CONNECTION)) {
         _if_connected.wait();
     }
 
     _cmutex.unlock();
 
-    return NSAPI_ERROR_OK;
+    if (!_if_blocking) {
+        return NSAPI_ERROR_OK;
+    } else {
+        return _connect_retval;
+    }
 }
 
 int WizFi360Interface::set_credentials(const char *ssid, const char *pass, nsapi_security_t security)
@@ -287,7 +335,7 @@ int WizFi360Interface::set_credentials(const char *ssid, const char *pass, nsapi
         if (pass_length >= WIZFI360_PASSPHRASE_MIN_LENGTH
                 && pass_length <= WIZFI360_PASSPHRASE_MAX_LENGTH) {
             memset(ap_pass, 0, sizeof(ap_pass));
-            strncpy(ap_pass, pass, sizeof(ap_pass));
+            strncpy(ap_pass, pass, WIZFI360_PASSPHRASE_MAX_LENGTH);
         } else {
             return NSAPI_ERROR_PARAMETER;
         }
@@ -315,7 +363,7 @@ int WizFi360Interface::disconnect()
     _initialized = false;
 
     nsapi_error_t status = _conn_status_to_error();
-    if (status == NSAPI_ERROR_NO_CONNECTION || !get_ip_address()) {
+    if (status == NSAPI_ERROR_NO_CONNECTION) {
         return NSAPI_ERROR_NO_CONNECTION;
     }
 
@@ -335,6 +383,8 @@ int WizFi360Interface::disconnect()
 
     // Power down the modem
     _rst_pin.rst_assert();
+    // Power off the modem
+    _pwr_pin.power_off();
 
     return ret;
 }
@@ -371,14 +421,25 @@ int8_t WizFi360Interface::get_rssi()
 
 int WizFi360Interface::scan(WiFiAccessPoint *res, unsigned count)
 {
-    nsapi_error_t status;
+    return scan(res, count, SCANMODE_ACTIVE, 0, 0);
+}
 
-    status = _init();
+int WizFi360Interface::scan(WiFiAccessPoint *res, unsigned count, scan_mode mode, unsigned t_max, unsigned t_min)
+{
+    if (t_max > WIZFI360_SCAN_TIME_MAX) {
+        return NSAPI_ERROR_PARAMETER;
+    }
+    if (mode == SCANMODE_ACTIVE && t_min > t_max) {
+        return NSAPI_ERROR_PARAMETER;
+    }
+
+    nsapi_error_t status = _init();
     if (status != NSAPI_ERROR_OK) {
         return status;
     }
 
-    return _wizfi360.scan(res, count);
+    return _wizfi360.scan(res, count, (mode == SCANMODE_ACTIVE ? WizFi360::SCANMODE_ACTIVE : WizFi360::SCANMODE_PASSIVE),
+                     t_min, t_max);
 }
 
 bool WizFi360Interface::_get_firmware_ok()
@@ -402,14 +463,12 @@ bool WizFi360Interface::_get_firmware_ok()
 nsapi_error_t WizFi360Interface::_init(void)
 {
     if (!_initialized) {
-        _hw_reset();
+        _pwr_pin.power_off();
+        _pwr_pin.power_on();
+        if (_reset() != NSAPI_ERROR_OK) {
+            return NSAPI_ERROR_DEVICE_ERROR;
+        }
 
-        if (!_wizfi360.at_available()) {
-            return NSAPI_ERROR_DEVICE_ERROR;
-        }
-        if (!_wizfi360.reset()) {
-            return NSAPI_ERROR_DEVICE_ERROR;
-        }
         if (!_wizfi360.echo_off()) {
             return NSAPI_ERROR_DEVICE_ERROR;
         }
@@ -420,6 +479,9 @@ nsapi_error_t WizFi360Interface::_init(void)
             return NSAPI_ERROR_DEVICE_ERROR;
         }
         if (!_wizfi360.set_default_wifi_mode(WizFi360::WIFIMODE_STATION)) {
+            return NSAPI_ERROR_DEVICE_ERROR;
+        }
+		if (!_wizfi360.set_country_code_policy(true, _ch_info.country_code, _ch_info.channel_start, _ch_info.channels)) {
             return NSAPI_ERROR_DEVICE_ERROR;
         }
         if (!_wizfi360.cond_enable_tcp_passive_mode()) {
@@ -434,19 +496,29 @@ nsapi_error_t WizFi360Interface::_init(void)
     return NSAPI_ERROR_OK;
 }
 
-void WizFi360Interface::_hw_reset()
+nsapi_error_t WizFi360Interface::_reset()
 {
     if (_rst_pin.is_connected()) {
         _rst_pin.rst_assert();
         // If you happen to use Pin7 CH_EN as reset pin, not needed otherwise
-        // https://www.espressif.com/sites/default/files/documentation/esp8266_hardware_design_guidelines_en.pdf
-        wait_ms(2); // Documentation says 200 us should have been enough, but experimentation shows that 1ms was not enough
+
+        ThisThread::sleep_for(2); // Documentation says 200 us; need 2 ticks to get minimum 1 ms.
         _wizfi360.flush();
         _rst_pin.rst_deassert();
+    } else {
+        _wizfi360.flush();
+        if (!_wizfi360.at_available()) {
+            return NSAPI_ERROR_DEVICE_ERROR;
+        }
+        if (!_wizfi360.reset()) {
+            return NSAPI_ERROR_DEVICE_ERROR;
+        }
     }
+
+    return _wizfi360.at_available() ? NSAPI_ERROR_OK : NSAPI_ERROR_DEVICE_ERROR;
 }
 
-struct esp8266_socket {
+struct WizFi360_socket {
     int id;
     nsapi_protocol_t proto;
     bool connected;
@@ -471,7 +543,7 @@ int WizFi360Interface::socket_open(void **handle, nsapi_protocol_t proto)
         return NSAPI_ERROR_NO_SOCKET;
     }
 
-    struct esp8266_socket *socket = new struct esp8266_socket;
+    struct WizFi360_socket *socket = new struct WizFi360_socket;
     if (!socket) {
         return NSAPI_ERROR_NO_SOCKET;
     }
@@ -486,7 +558,7 @@ int WizFi360Interface::socket_open(void **handle, nsapi_protocol_t proto)
 
 int WizFi360Interface::socket_close(void *handle)
 {
-    struct esp8266_socket *socket = (struct esp8266_socket *)handle;
+    struct WizFi360_socket *socket = (struct WizFi360_socket *)handle;
     int err = 0;
 
     if (!socket) {
@@ -497,6 +569,10 @@ int WizFi360Interface::socket_close(void *handle)
         err = NSAPI_ERROR_DEVICE_ERROR;
     }
 
+    _cbs[socket->id].callback = NULL;
+    _cbs[socket->id].data = NULL;
+    core_util_atomic_store_u8(&_cbs[socket->id].deferred, false);
+
     socket->connected = false;
     _sock_i[socket->id].open = false;
     _sock_i[socket->id].sport = 0;
@@ -506,7 +582,7 @@ int WizFi360Interface::socket_close(void *handle)
 
 int WizFi360Interface::socket_bind(void *handle, const SocketAddress &address)
 {
-    struct esp8266_socket *socket = (struct esp8266_socket *)handle;
+    struct WizFi360_socket *socket = (struct WizFi360_socket *)handle;
 
     if (!socket) {
         return NSAPI_ERROR_NO_SOCKET;
@@ -538,7 +614,7 @@ int WizFi360Interface::socket_listen(void *handle, int backlog)
 
 int WizFi360Interface::socket_connect(void *handle, const SocketAddress &addr)
 {
-    struct esp8266_socket *socket = (struct esp8266_socket *)handle;
+    struct WizFi360_socket *socket = (struct WizFi360_socket *)handle;
     nsapi_error_t ret;
 
     if (!socket) {
@@ -564,10 +640,15 @@ int WizFi360Interface::socket_accept(void *server, void **socket, SocketAddress 
 int WizFi360Interface::socket_send(void *handle, const void *data, unsigned size)
 {
     nsapi_error_t status;
-    struct esp8266_socket *socket = (struct esp8266_socket *)handle;
+    struct WizFi360_socket *socket = (struct WizFi360_socket *)handle;
+    uint8_t expect_false = false;
 
     if (!socket) {
         return NSAPI_ERROR_NO_SOCKET;
+    }
+
+    if (!_sock_i[socket->id].open) {
+        return NSAPI_ERROR_CONNECTION_LOST;
     }
 
     if (!size) {
@@ -575,15 +656,17 @@ int WizFi360Interface::socket_send(void *handle, const void *data, unsigned size
         return socket->proto == NSAPI_TCP ? 0 : NSAPI_ERROR_UNSUPPORTED;
     }
 
-    unsigned long int sendStartTime = rtos::Kernel::get_ms_count();
-    do {
-        status = _wizfi360.send(socket->id, data, size);
-    } while ((sendStartTime - rtos::Kernel::get_ms_count() < 50)
-            && (status != NSAPI_ERROR_OK));
+    status = _wizfi360.send(socket->id, data, size);
 
-    if (status == NSAPI_ERROR_WOULD_BLOCK && socket->proto == NSAPI_TCP) {
-        tr_debug("WizFi360Interface::socket_send(): enqueuing the event call");
-        _global_event_queue->call_in(100, callback(this, &WizFi360Interface::event));
+    if (status == NSAPI_ERROR_WOULD_BLOCK
+            && socket->proto == NSAPI_TCP
+            && core_util_atomic_cas_u8(&_cbs[socket->id].deferred, &expect_false, true)) {
+        tr_debug("Postponing SIGIO from the device");
+        if (!_global_event_queue->call_in(50, callback(this, &WizFi360Interface::event_deferred))) {
+            MBED_ERROR(MBED_MAKE_ERROR(MBED_MODULE_DRIVER, MBED_ERROR_CODE_ENOMEM), \
+                       "socket_send(): unable to add event to queue. Increase \"events.shared-eventsize\"\n");
+        }
+
     } else if (status == NSAPI_ERROR_WOULD_BLOCK && socket->proto == NSAPI_UDP) {
         status = NSAPI_ERROR_DEVICE_ERROR;
     }
@@ -593,10 +676,14 @@ int WizFi360Interface::socket_send(void *handle, const void *data, unsigned size
 
 int WizFi360Interface::socket_recv(void *handle, void *data, unsigned size)
 {
-    struct esp8266_socket *socket = (struct esp8266_socket *)handle;
+    struct WizFi360_socket *socket = (struct WizFi360_socket *)handle;
 
     if (!socket) {
         return NSAPI_ERROR_NO_SOCKET;
+    }
+
+    if (!_sock_i[socket->id].open) {
+        return NSAPI_ERROR_CONNECTION_LOST;
     }
 
     int32_t recv;
@@ -614,7 +701,7 @@ int WizFi360Interface::socket_recv(void *handle, void *data, unsigned size)
 
 int WizFi360Interface::socket_sendto(void *handle, const SocketAddress &addr, const void *data, unsigned size)
 {
-    struct esp8266_socket *socket = (struct esp8266_socket *)handle;
+    struct WizFi360_socket *socket = (struct WizFi360_socket *)handle;
 
     if (!socket) {
         return NSAPI_ERROR_NO_SOCKET;
@@ -644,7 +731,7 @@ int WizFi360Interface::socket_sendto(void *handle, const SocketAddress &addr, co
 
 int WizFi360Interface::socket_recvfrom(void *handle, SocketAddress *addr, void *data, unsigned size)
 {
-    struct esp8266_socket *socket = (struct esp8266_socket *)handle;
+    struct WizFi360_socket *socket = (struct WizFi360_socket *)handle;
 
     if (!socket) {
         return NSAPI_ERROR_NO_SOCKET;
@@ -660,7 +747,7 @@ int WizFi360Interface::socket_recvfrom(void *handle, SocketAddress *addr, void *
 
 void WizFi360Interface::socket_attach(void *handle, void (*callback)(void *), void *data)
 {
-    struct esp8266_socket *socket = (struct esp8266_socket *)handle;
+    struct WizFi360_socket *socket = (struct WizFi360_socket *)handle;
     _cbs[socket->id].callback = callback;
     _cbs[socket->id].data = data;
 }
@@ -668,7 +755,7 @@ void WizFi360Interface::socket_attach(void *handle, void (*callback)(void *), vo
 nsapi_error_t WizFi360Interface::setsockopt(nsapi_socket_t handle, int level,
                                            int optname, const void *optval, unsigned optlen)
 {
-    struct esp8266_socket *socket = (struct esp8266_socket *)handle;
+    struct WizFi360_socket *socket = (struct WizFi360_socket *)handle;
 
     if (!optlen) {
         return NSAPI_ERROR_PARAMETER;
@@ -700,7 +787,7 @@ nsapi_error_t WizFi360Interface::setsockopt(nsapi_socket_t handle, int level,
 
 nsapi_error_t WizFi360Interface::getsockopt(nsapi_socket_t handle, int level, int optname, void *optval, unsigned *optlen)
 {
-    struct esp8266_socket *socket = (struct esp8266_socket *)handle;
+    struct WizFi360_socket *socket = (struct WizFi360_socket *)handle;
 
     if (!optval || !optlen) {
         return NSAPI_ERROR_PARAMETER;
@@ -726,13 +813,29 @@ nsapi_error_t WizFi360Interface::getsockopt(nsapi_socket_t handle, int level, in
 
 void WizFi360Interface::event()
 {
+    if (!_oob_event_id) {
+        // Throttles event creation by using arbitrary small delay
+        _oob_event_id = _global_event_queue->call_in(50, callback(this, &WizFi360Interface::proc_oob_evnt));
+        if (!_oob_event_id) {
+            MBED_ERROR(MBED_MAKE_ERROR(MBED_MODULE_DRIVER, MBED_ERROR_CODE_ENOMEM), \
+                       "WizFi360Interface::event(): unable to add event to queue. Increase \"events.shared-eventsize\"\n");
+        }
+    }
     for (int i = 0; i < WIZFI360_SOCKET_COUNT; i++) {
         if (_cbs[i].callback) {
             _cbs[i].callback(_cbs[i].data);
         }
     }
 }
-
+void WizFi360Interface::event_deferred()
+{
+    for (int i = 0; i < WIZFI360_SOCKET_COUNT; i++) {
+        uint8_t expect_true = true;
+        if (core_util_atomic_cas_u8(&_cbs[i].deferred, &expect_true, false) && _cbs[i].callback) {
+            _cbs[i].callback(_cbs[i].data);
+        }
+    }
+}
 void WizFi360Interface::attach(Callback<void(nsapi_event_t, intptr_t)> status_cb)
 {
     _conn_stat_cb = status_cb;
@@ -747,20 +850,17 @@ nsapi_connection_status_t WizFi360Interface::get_connection_status() const
 
 WiFiInterface *WiFiInterface::get_default_instance()
 {
-    static WizFi360Interface esp;
-    return &esp;
+    static WizFi360Interface wizfi360;
+    return &wizfi360;
 }
 
 #endif
 
-void WizFi360Interface::update_conn_state_cb()
+void WizFi360Interface::refresh_conn_state_cb()
 {
     nsapi_connection_status_t prev_stat = _conn_stat;
     _conn_stat = _wizfi360.connection_status();
 
-    if (prev_stat == _conn_stat) {
-        return;
-    }
 
     switch (_conn_stat) {
         // Doesn't require changes
@@ -776,7 +876,17 @@ void WizFi360Interface::update_conn_state_cb()
         default:
             _initialized = false;
             _conn_stat = NSAPI_STATUS_DISCONNECTED;
+            for (int i = 0; i < WIZFI360_SOCKET_COUNT; i++) {
+                _sock_i[i].open = false;
+                _sock_i[i].sport = 0;
+            }
     }
+
+    if (prev_stat == _conn_stat) {
+        return;
+    }
+
+    tr_debug("refresh_conn_state_cb(): changed to %d", _conn_stat);
 
     // Inform upper layers
     if (_conn_stat_cb) {
@@ -786,6 +896,7 @@ void WizFi360Interface::update_conn_state_cb()
 
 void WizFi360Interface::proc_oob_evnt()
 {
+    _oob_event_id = 0; // Allows creation of a new event
         _wizfi360.bg_process_oob(WIZFI360_RECV_TIMEOUT, true);
 }
 
@@ -819,5 +930,26 @@ nsapi_error_t WizFi360Interface::set_blocking(bool blocking)
     return NSAPI_ERROR_OK;
 }
 
+nsapi_error_t WizFi360Interface::set_country_code(bool track_ap, const char *country_code, int len, int channel_start, int channels)
+{
+    for (int i = 0; i < len; i++) {
+        // Validation done by firmware
+        if (!country_code[i]) {
+            tr_warning("invalid country code");
+            return NSAPI_ERROR_PARAMETER;
+        }
+    }
+
+    _ch_info.track_ap = track_ap;
+
+    // Firmware takes only first three characters
+    strncpy(_ch_info.country_code, country_code, sizeof(_ch_info.country_code));
+    _ch_info.country_code[sizeof(_ch_info.country_code) - 1] = '\0';
+
+    _ch_info.channel_start = channel_start;
+    _ch_info.channels = channels;
+
+    return NSAPI_ERROR_OK;
+}
 
 #endif

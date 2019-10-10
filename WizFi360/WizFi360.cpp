@@ -1,6 +1,6 @@
-/* This WizFi360 Driver referred to ESP8266 Driver in mbed-os
+/* This WizFi360 Driver referred to WIZFI360 Driver in mbed-os
  *
- * ESP8266 Example
+ * WIZFI360 Example
  * Copyright (c) 2015 ARM Limited
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,9 +16,13 @@
  * limitations under the License.
  */
 
-#if DEVICE_SERIAL && defined(MBED_CONF_EVENTS_PRESENT) && defined(MBED_CONF_NSAPI_PRESENT) && defined(MBED_CONF_RTOS_PRESENT)
+#if DEVICE_SERIAL && DEVICE_INTERRUPTIN && defined(MBED_CONF_EVENTS_PRESENT) && defined(MBED_CONF_NSAPI_PRESENT) && defined(MBED_CONF_RTOS_PRESENT)
+#ifndef __STDC_FORMAT_MACROS
+#define __STDC_FORMAT_MACROS
+#endif
+#include <inttypes.h>
+
 #include <string.h>
-#include <stdint.h>
 #include <stdlib.h>
 
 #include "WizFi360.h"
@@ -27,8 +31,9 @@
 #include "PinNames.h"
 #include "platform/Callback.h"
 #include "platform/mbed_error.h"
+#include "rtos/Kernel.h"
 
-#define TRACE_GROUP  "ESPA" // WizFi360 AT layer
+#define TRACE_GROUP  "WIZFIA" // WizFi360 AT layer
 
 #define WIZFI360_DEFAULT_BAUD_RATE   115200
 #define WIZFI360_ALL_SOCKET_IDS      -1
@@ -40,7 +45,7 @@ WizFi360::WizFi360(PinName tx, PinName rx, bool debug, PinName rts, PinName cts)
       _at_v(-1, -1, -1),
       _tcp_passive(false),
       _callback(0),
-      _serial(tx, rx, WIZFI360_DEFAULT_BAUD_RATE),
+      _serial(tx, rx, MBED_CONF_WIZFI360_SERIAL_BAUDRATE),
       _serial_rts(rts),
       _serial_cts(cts),
       _parser(&_serial),
@@ -53,9 +58,11 @@ WizFi360::WizFi360(PinName tx, PinName rx, bool debug, PinName rts, PinName cts)
       _sock_already(false),
       _closed(false),
       _busy(false),
+      _reset_check(_rmutex),
+      _reset_done(false),
       _conn_status(NSAPI_STATUS_DISCONNECTED)
 {
-    _serial.set_baud(WIZFI360_DEFAULT_BAUD_RATE);
+    _serial.set_baud(MBED_CONF_WIZFI360_SERIAL_BAUDRATE);
     _parser.debug_on(debug);
     _parser.set_delimiter("\r\n");
     _parser.oob("+IPD", callback(this, &WizFi360::_oob_packet_hdlr));
@@ -73,11 +80,12 @@ WizFi360::WizFi360(PinName tx, PinName rx, bool debug, PinName rts, PinName cts)
     _parser.oob("UNLINK", callback(this, &WizFi360::_oob_socket_close_err));
     _parser.oob("ALREADY CONNECTED", callback(this, &WizFi360::_oob_conn_already));
     _parser.oob("ERROR", callback(this, &WizFi360::_oob_err));
+    _parser.oob("ready", callback(this, &WizFi360::_oob_ready));
+    _parser.oob("+CWLAP:", callback(this, &WizFi360::_oob_scan_results));
     // Don't expect to find anything about the watchdog reset in official documentation
-    //https://techtutorialsx.com/2017/01/21/esp8266-watchdog-functions/
+    //https://techtutorialsx.com/2017/01/21/WIZFI360 watchdog-functions/
     _parser.oob("wdt reset", callback(this, &WizFi360::_oob_watchdog_reset));
     // Don't see a reason to make distiction between software(Software WDT reset) and hardware(wdt reset) watchdog treatment
-    //https://github.com/esp8266/Arduino/blob/4897e0006b5b0123a2fa31f67b14a3fff65ce561/doc/faq/a02-my-esp-crashes.md#watchdog
     _parser.oob("Soft WDT reset", callback(this, &WizFi360::_oob_watchdog_reset));
     _parser.oob("busy ", callback(this, &WizFi360::_oob_busy));
     // NOTE: documentation v3.0 says '+CIPRECVDATA:<data_len>,' but it's not how the FW responds...
@@ -90,6 +98,10 @@ WizFi360::WizFi360(PinName tx, PinName rx, bool debug, PinName rts, PinName cts)
         _sock_i[i].tcp_data_avbl = 0;
         _sock_i[i].tcp_data_rcvd = 0;
     }
+
+    _scan_r.res = NULL;
+    _scan_r.limit = 0;
+    _scan_r.cnt = 0;
 }
 
 bool WizFi360::at_available()
@@ -172,7 +184,7 @@ bool WizFi360::stop_uart_hw_flow_ctrl(void)
         _serial.set_flow_control(SerialBase::Disabled, _serial_rts, _serial_cts);
 
         // Stop WizFi360's flow control
-        done = _parser.send("AT+UART_CUR=%u,8,1,0,0", WIZFI360_DEFAULT_BAUD_RATE)
+        done = _parser.send("AT+UART_CUR=%u,8,1,0,0", MBED_CONF_WIZFI360_SERIAL_BAUDRATE)
                && _parser.recv("OK\n");
     }
 
@@ -185,27 +197,39 @@ bool WizFi360::start_uart_hw_flow_ctrl(void)
     bool done = true;
 
 #if DEVICE_SERIAL_FC
+    _smutex.lock();
     if (_serial_rts != NC && _serial_cts != NC) {
        // Start board's flow control
-        _serial.set_flow_control(SerialBase::RTSCTS, _serial_rts, _serial_cts);
 
         // Start WizFi360's flow control
-        done = _parser.send("AT+UART_CUR=%u,8,1,0,3", WIZFI360_DEFAULT_BAUD_RATE)
+        done = _parser.send("AT+UART_CUR=%u,8,1,0,3", MBED_CONF_WIZFI360_SERIAL_BAUDRATE)
                && _parser.recv("OK\n");
+
+        if (done) {
+            // Start board's flow control
+            _serial.set_flow_control(SerialBase::RTSCTS, _serial_rts, _serial_cts);
+        }
 
     } else if (_serial_rts != NC) {
         _serial.set_flow_control(SerialBase::RTS, _serial_rts, NC);
 
         // Enable WizFi360's CTS pin
-        done = _parser.send("AT+UART_CUR=%u,8,1,0,2", WIZFI360_DEFAULT_BAUD_RATE)
+        done = _parser.send("AT+UART_CUR=%u,8,1,0,2", MBED_CONF_WIZFI360_SERIAL_BAUDRATE)
                && _parser.recv("OK\n");
 
     } else if (_serial_cts != NC) {
         // Enable WizFi360's RTS pin
-        done = _parser.send("AT+UART_CUR=%u,8,1,0,1", WIZFI360_DEFAULT_BAUD_RATE)
+        done = _parser.send("AT+UART_CUR=%u,8,1,0,1", MBED_CONF_WIZFI360_SERIAL_BAUDRATE)
                && _parser.recv("OK\n");
 
-        _serial.set_flow_control(SerialBase::CTS, NC, _serial_cts);
+        if (done) {
+            _serial.set_flow_control(SerialBase::CTS, NC, _serial_cts);
+        }
+    }
+    _smutex.unlock();
+
+    if (!done) {
+        tr_debug("Enable UART HW flow control: FAIL");
     }
 #else
     if (_serial_rts != NC || _serial_cts != NC) {
@@ -236,20 +260,34 @@ bool WizFi360::startup(int mode)
 
 bool WizFi360::reset(void)
 {
+    static const int WIZFI360_BOOTTIME = 10000; // [ms]
     bool done = false;
 
     _smutex.lock();
-    set_timeout(WIZFI360_CONNECT_TIMEOUT);
 
+    unsigned long int start_time = rtos::Kernel::get_ms_count();
+    _reset_done = false;
+    set_timeout(WIZFI360_RECV_TIMEOUT);
     for (int i = 0; i < 2; i++) {
-        if (_parser.send("AT+RST")
-                && _parser.recv("OK\n")
-                && _parser.recv("ready")) {
-            done = true;
+        if (!_parser.send("AT+RST") || !_parser.recv("OK\n")) {
+            tr_debug("reset(): AT+RST failed or no response");
+            continue;
+        }
+
+        _rmutex.lock();
+        while ((rtos::Kernel::get_ms_count() - start_time < WIZFI360_BOOTTIME) && !_reset_done) {
+            _process_oob(WIZFI360_RECV_TIMEOUT, true); // UART mutex claimed -> need to check for OOBs ourselves
+            _reset_check.wait_for(100); // Arbitrary relatively short delay
+        }
+
+        done = _reset_done;
+        _rmutex.unlock();
+        if (done) {
             break;
         }
     }
 
+    tr_debug("reset(): done: %s", done ? "OK" : "FAIL");
     _clear_socket_packets(WIZFI360_ALL_SOCKET_IDS);
     set_timeout();
     _smutex.unlock();
@@ -296,8 +334,8 @@ nsapi_error_t WizFi360::connect(const char *ap, const char *passPhrase)
     _smutex.lock();
     set_timeout(WIZFI360_CONNECT_TIMEOUT);
 
-    _parser.send("AT+CWJAP_CUR=\"%s\",\"%s\"", ap, passPhrase);
-    if (!_parser.recv("OK\n")) {
+    bool res = _parser.send("AT+CWJAP_CUR=\"%s\",\"%s\"", ap, passPhrase);
+    if (!res || !_parser.recv("OK\n")) {
         if (_fail) {
             if (_connect_error == 1) {
                 ret = NSAPI_ERROR_CONNECTION_TIMEOUT;
@@ -403,43 +441,59 @@ int8_t WizFi360::rssi()
     set_timeout();
     _smutex.unlock();
 
+    WiFiAccessPoint ap[1];
+    _scan_r.res = ap;
+    _scan_r.limit = 1;
+    _scan_r.cnt = 0;
+
     _smutex.lock();
     set_timeout(WIZFI360_CONNECT_TIMEOUT);
     if (!(_parser.send("AT+CWLAP=\"\",\"%s\",", bssid)
             && _parser.recv("+CWLAP:(%*d,\"%*[^\"]\",%hhd,", &rssi)
             && _parser.recv("OK\n"))) {
-        _smutex.unlock();
-        return 0;
+        rssi = 0;
+    } else if (_scan_r.cnt == 1) {
+        //All OK so read and return rssi
+        rssi = ap[0].get_rssi();
     }
+
+    _scan_r.cnt = 0;
+    _scan_r.res = NULL;
     set_timeout();
     _smutex.unlock();
 
     return rssi;
 }
 
-int WizFi360::scan(WiFiAccessPoint *res, unsigned limit)
+int WizFi360::scan(WiFiAccessPoint *res, unsigned limit, scan_mode mode, unsigned t_max, unsigned t_min)
 {
-    unsigned cnt = 0;
-    nsapi_wifi_ap_t ap;
-
     _smutex.lock();
-    set_timeout(WIZFI360_CONNECT_TIMEOUT);
 
-    if (!_parser.send("AT+CWLAP")) {
-        _smutex.unlock();
-        return NSAPI_ERROR_DEVICE_ERROR;
+    // Default timeout plus time spend scanning each channel
+    set_timeout(WIZFI360_MISC_TIMEOUT + 13 * (t_max ? t_max : WIZFI360_SCAN_TIME_MAX_DEFAULT));
+
+    _scan_r.res = res;
+    _scan_r.limit = limit;
+    _scan_r.cnt = 0;
+
+    bool ret_parse_send = true;
+
+    if (FW_AT_LEAST_VERSION(_at_v.major, _at_v.minor, _at_v.patch, 0, WIZFI360_AT_VERSION_WIFI_SCAN_CHANGE)) {
+        ret_parse_send = _parser.send("AT+CWLAP=,,,%u,%u,%u", (mode == SCANMODE_ACTIVE ? 0 : 1), t_min, t_max);
+    } else {
+        ret_parse_send = _parser.send("AT+CWLAP");
     }
 
-    while (_recv_ap(&ap)) {
-        if (cnt < limit) {
-            res[cnt] = WiFiAccessPoint(ap);
-        }
-
-        cnt++;
-        if (limit != 0 && cnt >= limit) {
-            break;
+    if (!(ret_parse_send && _parser.recv("OK\n"))) {
+        tr_warning("scan(): AP info parsing aborted");
+        // Lets be happy about partial success and not return NSAPI_ERROR_DEVICE_ERROR
+        if (!_scan_r.cnt) {
+            _scan_r.cnt = NSAPI_ERROR_DEVICE_ERROR;
         }
     }
+    int cnt = _scan_r.cnt;
+    _scan_r.res = NULL;
+
     set_timeout();
     _smutex.unlock();
 
@@ -559,6 +613,9 @@ bool WizFi360::dns_lookup(const char *name, char *ip)
 
 nsapi_error_t WizFi360::send(int id, const void *data, uint32_t amount)
 {
+    #if 1 //teddy 191007
+    int i = 0, j = 0;
+    #endif
     nsapi_error_t ret = NSAPI_ERROR_DEVICE_ERROR;
     // +CIPSEND supports up to 2048 bytes at a time
     // Data stream can be truncated
@@ -574,17 +631,21 @@ nsapi_error_t WizFi360::send(int id, const void *data, uint32_t amount)
     set_timeout(WIZFI360_SEND_TIMEOUT);
     _busy = false;
     _error = false;
-    if (!_parser.send("AT+CIPSEND=%d,%lu", id, amount)) {
+    if (!_parser.send("AT+CIPSEND=%d,%" PRIu32, id, amount)) {
         tr_debug("WizFi360::send(): AT+CIPSEND failed");
         goto END;
     }
-
+    #if 1 //teddy 191007
+    for(i=0; i<6000; i++)
+    {
+        j++;
+    }
+    #endif
     if(!_parser.recv(">")) {
         tr_debug("WizFi360::send(): didn't get \">\"");
         ret = NSAPI_ERROR_WOULD_BLOCK;
         goto END;
     }
-
     if (_parser.write((char *)data, (int)amount) >= 0 && _parser.recv("SEND OK")) {
         ret = NSAPI_ERROR_OK;
     }
@@ -647,7 +708,7 @@ void WizFi360::_oob_packet_hdlr()
     pdu_len = sizeof(struct packet) + amount;
 
     if ((_heap_usage + pdu_len) > MBED_CONF_WIZFI360_SOCKET_BUFSIZE) {
-        tr_debug("\"esp8266.socket-bufsize\"-limit exceeded, packet dropped");
+        tr_debug("\"WizFi360.socket-bufsize\"-limit exceeded, packet dropped");
         return;
     }
 
@@ -707,13 +768,15 @@ int32_t WizFi360::_recv_tcp_passive(int id, void *data, uint32_t amount, uint32_
         amount = amount > 2048 ? 2048 : amount;
 
         // NOTE: documentation v3.0 says '+CIPRECVDATA:<data_len>,' but it's not how the FW responds...
-        bool done = _parser.send("AT+CIPRECVDATA=%d,%lu", id, amount)
-                                && _parser.recv("OK\n");
-        if (!done) {
-            tr_debug("data request failed");
-        }
+        bool done = _parser.send("AT+CIPRECVDATA=%d,%" PRIu32, id, amount)
+                    && _parser.recv("OK\n");
+
         _sock_i[id].tcp_data = NULL;
         _sock_active_id = -1;
+
+        if (!done) {
+            goto BUSY;
+        }
 
         // update internal variable tcp_data_avbl to reflect the remaining data
         if (_sock_i[id].tcp_data_rcvd > 0) {
@@ -735,6 +798,18 @@ int32_t WizFi360::_recv_tcp_passive(int id, void *data, uint32_t amount, uint32_
         ret = 0;
     }
 
+    _smutex.unlock();
+    return ret;
+
+BUSY:
+    _process_oob(WIZFI360_RECV_TIMEOUT, true);
+    if (_busy) {
+        tr_debug("_recv_tcp_passive(): modem busy");
+        ret = NSAPI_ERROR_WOULD_BLOCK;
+    } else {
+        tr_error("_recv_tcp_passive(): unknown state");
+        ret = NSAPI_ERROR_DEVICE_ERROR;
+    }
     _smutex.unlock();
     return ret;
 }
@@ -925,13 +1000,13 @@ void WizFi360::attach(Callback<void()> status_cb)
 
 bool WizFi360::_recv_ap(nsapi_wifi_ap_t *ap)
 {
-    int sec;
+    int sec = NSAPI_SECURITY_UNKNOWN;
     int dummy;
-    bool ret;
+    int ret;
 
     if (FW_AT_LEAST_VERSION(_at_v.major, _at_v.minor, _at_v.patch, 0, WIZFI360_AT_VERSION_WIFI_SCAN_CHANGE)) {
-        ret = _parser.recv("+CWLAP:(%d,\"%32[^\"]\",%hhd,\"%hhx:%hhx:%hhx:%hhx:%hhx:%hhx\",%hhu,%d,%d,%d,%d,%d,%d)\n",
-                        &sec,
+        ret = _parser.scanf("(%d,\"%32[^\"]\",%hhd,\"%hhx:%hhx:%hhx:%hhx:%hhx:%hhx\",%hhu,%d,%d,%d,%d,%d,%d)\n",
+                            &sec,
                         ap->ssid,
                         &ap->rssi,
                         &ap->bssid[0], &ap->bssid[1], &ap->bssid[2], &ap->bssid[3], &ap->bssid[4], &ap->bssid[5],
@@ -943,24 +1018,40 @@ bool WizFi360::_recv_ap(nsapi_wifi_ap_t *ap)
                         &dummy,
                         &dummy);
     } else {
-        ret = _parser.recv("+CWLAP:(%d,\"%32[^\"]\",%hhd,\"%hhx:%hhx:%hhx:%hhx:%hhx:%hhx\",%hhu,%d,%d)\n",
-                        &sec,
+        ret = _parser.scanf("(%d,\"%32[^\"]\",%hhd,\"%hhx:%hhx:%hhx:%hhx:%hhx:%hhx\",%hhu,%d,%d)\n",
+                            &sec,
                         ap->ssid,
                         &ap->rssi,
                         &ap->bssid[0], &ap->bssid[1], &ap->bssid[2], &ap->bssid[3], &ap->bssid[4], &ap->bssid[5],
                         &ap->channel,
                         &dummy,
                         &dummy);
+    }
 
+    if (ret < 0) {
+        _parser.abort();
+        tr_warning("_recv_ap(): AP info missing");
     }
 
     ap->security = sec < 5 ? (nsapi_security_t)sec : NSAPI_SECURITY_UNKNOWN;
 
-    return ret;
+    return ret < 0 ? false : true;
 }
 
 void WizFi360::_oob_watchdog_reset()
 {
+    MBED_ERROR(MBED_MAKE_ERROR(MBED_MODULE_DRIVER, MBED_ERROR_CODE_ETIME), \
+               "_oob_watchdog_reset() modem watchdog reset triggered\n");
+}
+
+void WizFi360::_oob_ready()
+{
+
+    _rmutex.lock();
+    _reset_done = true;
+    _reset_check.notify_all();
+    _rmutex.unlock();
+
     for (int i = 0; i < SOCKET_COUNT; i++) {
         _sock_i[i].open = false;
     }
@@ -968,6 +1059,8 @@ void WizFi360::_oob_watchdog_reset()
     // Makes possible to reinitialize
     _conn_status = NSAPI_STATUS_ERROR_UNSUPPORTED;
     _conn_stat_cb();
+
+    tr_debug("_oob_reset(): reset detected");
 }
 
 void WizFi360::_oob_busy()
@@ -997,7 +1090,7 @@ void WizFi360::_oob_tcp_data_hdlr()
 
     MBED_ASSERT(_sock_active_id >= 0 && _sock_active_id < 5);
 
-    if (!_parser.recv("%ld:", &len)) {
+    if (!_parser.recv("%" SCNd32 ":", &len)) {
         return;
     }
 
@@ -1006,6 +1099,19 @@ void WizFi360::_oob_tcp_data_hdlr()
     }
 
     _sock_i[_sock_active_id].tcp_data_rcvd = len;
+}
+
+void WizFi360::_oob_scan_results()
+{
+    nsapi_wifi_ap_t ap;
+
+    if (_recv_ap(&ap)) {
+        if (_scan_r.res && _scan_r.cnt < _scan_r.limit) {
+            _scan_r.res[_scan_r.cnt] = WiFiAccessPoint(ap);
+        }
+
+        _scan_r.cnt++;
+    }
 }
 
 void WizFi360::_oob_connect_err()
@@ -1096,8 +1202,13 @@ void WizFi360::_oob_connection_status()
                        "WizFi360::_oob_connection_status: invalid AT cmd\n");
         }
     } else {
-        MBED_ERROR(MBED_MAKE_ERROR(MBED_MODULE_DRIVER, MBED_ERROR_CODE_ENOMSG), \
-                   "WizFi360::_oob_connection_status: network status timed out\n");
+        tr_error("_oob_connection_status(): network status timeout, disconnecting");
+        if (!disconnect()) {
+            tr_warning("_oob_connection_status(): driver initiated disconnect failed");
+        } else {
+            tr_debug("_oob_connection_status(): disconnected");
+        }
+        _conn_status = NSAPI_STATUS_ERROR_UNSUPPORTED;
     }
 
     MBED_ASSERT(_conn_stat_cb);
@@ -1141,4 +1252,33 @@ nsapi_connection_status_t WizFi360::connection_status() const
 {
     return _conn_status;
 }
+
+bool WizFi360::set_country_code_policy(bool track_ap, const char *country_code, int channel_start, int channels)
+{
+    if (!(FW_AT_LEAST_VERSION(_at_v.major, _at_v.minor, _at_v.patch, 0, WIZFI360_AT_VERSION_WIFI_SCAN_CHANGE))) {
+        return true;
+    }
+
+    int t_ap = track_ap ? 0 : 1;
+
+    _smutex.lock();
+    bool done = _parser.send("AT+CWCOUNTRY_DEF=%d,\"%s\",%d,%d", t_ap, country_code, channel_start, channels)
+                && _parser.recv("OK\n");
+
+    if (!done) {
+        tr_error("\"AT+CWCOUNTRY_DEF=%d,\"%s\",%d,%d\" - FAIL", t_ap, country_code, channel_start, channels);
+    }
+
+    done &= _parser.send("AT+CWCOUNTRY_CUR=%d,\"%s\",%d,%d", t_ap, country_code, channel_start, channels)
+            && _parser.recv("OK\n");
+
+    if (!done) {
+        tr_error("\"AT+CWCOUNTRY_CUR=%d,\"%s\",%d,%d\" - FAIL", t_ap, country_code, channel_start, channels);
+    }
+
+    _smutex.unlock();
+
+    return done;
+}
+
 #endif

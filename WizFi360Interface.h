@@ -1,6 +1,6 @@
-/* This WizFi360 Driver referred to ESP8266 Driver in mbed-os
+/* This WizFi360 Driver referred to WIZFI360 Driver in mbed-os
  *
- * ESP8266 implementation of NetworkInterfaceAPI
+ * WIZFI360 implementation of NetworkInterfaceAPI
  * Copyright (c) 2015 ARM Limited
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,8 +19,9 @@
 #ifndef WIZFI360_INTERFACE_H
 #define WIZFI360_INTERFACE_H
 
-#if DEVICE_SERIAL && defined(MBED_CONF_EVENTS_PRESENT) && defined(MBED_CONF_NSAPI_PRESENT) && defined(MBED_CONF_RTOS_PRESENT)
+#if DEVICE_SERIAL && DEVICE_INTERRUPTIN && defined(MBED_CONF_EVENTS_PRESENT) && defined(MBED_CONF_NSAPI_PRESENT) && defined(MBED_CONF_RTOS_PRESENT)
 #include "drivers/DigitalOut.h"
+#include "drivers/Timer.h"
 #include "WizFi360/WizFi360.h"
 #include "events/EventQueue.h"
 #include "events/mbed_shared_queues.h"
@@ -36,6 +37,8 @@
 
 #define WIZFI360_SOCKET_COUNT 5
 
+#define WIZFI360_INTERFACE_CONNECT_INTERVAL_MS (5000)
+#define WIZFI360_INTERFACE_CONNECT_TIMEOUT_MS (2 * WIZFI360_CONNECT_TIMEOUT + WIZFI360_INTERFACE_CONNECT_INTERVAL_MS)
 #ifdef TARGET_FF_ARDUINO
 #ifndef MBED_CONF_WIZFI360_TX
 #define MBED_CONF_WIZFI360_TX D1
@@ -46,6 +49,17 @@
 #endif
 #endif /* TARGET_FF_ARDUINO */
 
+#ifndef MBED_CONF_WIZFI360_COUNTRY_CODE
+#define MBED_CONF_WIZFI360_COUNTRY_CODE "KR"
+#endif
+
+#ifndef MBED_CONF_WIZFI360_CHANNEL_START
+#define MBED_CONF_WIZFI360_CHANNEL_START 1
+#endif
+
+#ifndef MBED_CONF_WIZFI360_CHANNELS
+#define MBED_CONF_WIZFI360_CHANNELS 13
+#endif
 /** WizFi360Interface class
  *  Implementation of the NetworkStack for the WizFi360
  */
@@ -64,7 +78,7 @@ public:
      * @param rx        RX pin
      * @param debug     Enable debugging
      */
-    WizFi360Interface(PinName tx, PinName rx, bool debug = false, PinName rts = NC, PinName cts = NC, PinName rst = NC);
+    WizFi360Interface(PinName tx, PinName rx, bool debug = false, PinName rts = NC, PinName cts = NC, PinName rst = NC, PinName pwr= NC);
 
     /**
      * @brief WizFi360Interface default destructor
@@ -147,6 +161,13 @@ public:
      */
     virtual int8_t get_rssi();
 
+    /** Scan mode
+     */
+    enum scan_mode {
+        SCANMODE_ACTIVE, /*!< active mode */
+        SCANMODE_PASSIVE /*!< passive mode */
+    };
+
     /** Scan for available networks
      *
      * This function will block.
@@ -158,6 +179,20 @@ public:
      *                  see @a nsapi_error
      */
     virtual int scan(WiFiAccessPoint *res, unsigned count);
+
+    /** Scan for available networks
+     *
+     * This function will block.
+     *
+     * @param  ap    Pointer to allocated array to store discovered AP
+     * @param  count Size of allocated @a res array, or 0 to only count available AP
+     * @param  t_max Scan time for each channel - 0-1500ms. If 0 - uses default value
+     * @param  t_min Minimum for each channel in active mode - 0-1500ms. If 0 - uses default value. Omit in passive mode
+     * @return       Number of entries in @a, or if @a count was 0 number of available networks, negative on error
+     *               see @a nsapi_error
+     */
+    virtual int scan(WiFiAccessPoint *res, unsigned count, scan_mode mode = SCANMODE_PASSIVE,
+                     unsigned t_max = 0, unsigned t_min = 0);
 
     /** Translates a hostname to an IP address with specific version
      *
@@ -327,10 +362,22 @@ protected:
      */
     virtual nsapi_error_t set_blocking(bool blocking);
 
+    /** Set country code
+     *
+     *  @param track_ap      if TRUE, use country code used by the AP WIZFI360 is connected to,
+     *                       otherwise uses country_code always
+     *  @param country_code  ISO 3166-1 coded, 2 character alphanumeric country code assumed
+     *  @param len           Length of the country code
+     *  @param channel_start The channel number to start at
+     *  @param channel       Number of channels
+     *  @return              NSAPI_ERROR_OK on success, negative error code on failure.
+     */
+    nsapi_error_t set_country_code(bool track_ap, const char *country_code, int len, int channel_start, int channels);
+
 private:
     // AT layer
     WizFi360 _wizfi360;
-    void update_conn_state_cb();
+    void refresh_conn_state_cb();
 
     // HW reset pin
     class ResetPin {
@@ -343,6 +390,16 @@ private:
         mbed::DigitalOut  _rst_pin;
     } _rst_pin;
 
+    // HW power pin
+    class PowerPin {
+    public:
+        PowerPin(PinName pwr_pin);
+        void power_on();
+        void power_off();
+        bool is_connected();
+    private:
+        mbed::DigitalOut  _pwr_pin;
+    } _pwr_pin;
 
     // Credentials
     static const int WIZFI360_SSID_MAX_LENGTH = 32; /* 32 is what 802.11 defines as longest possible name */
@@ -352,11 +409,21 @@ private:
     char ap_pass[WIZFI360_PASSPHRASE_MAX_LENGTH + 1]; /* The longest possible passphrase; +1 for the \0 */
     nsapi_security_t _ap_sec;
 
+    // Country code
+    struct _channel_info {
+        bool track_ap; // Set country code based on the AP WIZFI360 is connected to
+        char country_code[4]; // ISO 3166-1 coded, 2-3 character alphanumeric country code - +1 for the '\0' - assumed. Documentation doesn't tell.
+        int channel_start;
+        int channels;
+    };
+    struct _channel_info _ch_info;
+
     bool _if_blocking; // NetworkInterface, blocking or not
     rtos::ConditionVariable _if_connected;
 
     // connect status reporting
     nsapi_error_t _conn_status_to_error();
+    mbed::Timer _conn_timer;
 
     // Drivers's socket info
     struct _sock_info {
@@ -367,16 +434,19 @@ private:
 
     // Driver's state
     int _initialized;
+    nsapi_error_t _connect_retval;
     bool _get_firmware_ok();
     nsapi_error_t _init(void);
-    void _hw_reset();
+    nsapi_error_t _reset();
 
     //sigio
     struct {
         void (*callback)(void *);
         void *data;
+        uint8_t deferred;
     } _cbs[WIZFI360_SOCKET_COUNT];
     void event();
+    void event_deferred();
 
     // Connection state reporting to application
     nsapi_connection_status_t _conn_stat;
@@ -388,7 +458,6 @@ private:
     int _oob_event_id;
     int _connect_event_id;
     void proc_oob_evnt();
-    void _oob2global_event_queue();
     void _connect_async();
     rtos::Mutex _cmutex; // Protect asynchronous connection logic
 
