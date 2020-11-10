@@ -1,7 +1,6 @@
-/* This WizFi360 Driver referred to WIZFI360 Driver in mbed-os
- *
- * WIZFI360 implementation of NetworkInterfaceAPI
+/* WizFi360 implementation of NetworkInterfaceAPI
  * Copyright (c) 2015 ARM Limited
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,26 +18,30 @@
 #ifndef WIZFI360_INTERFACE_H
 #define WIZFI360_INTERFACE_H
 
-#if DEVICE_SERIAL && DEVICE_INTERRUPTIN && defined(MBED_CONF_EVENTS_PRESENT) && defined(MBED_CONF_NSAPI_PRESENT) && defined(MBED_CONF_RTOS_PRESENT)
+#if DEVICE_SERIAL && DEVICE_INTERRUPTIN && defined(MBED_CONF_EVENTS_PRESENT) && defined(MBED_CONF_NSAPI_PRESENT) && defined(MBED_CONF_RTOS_API_PRESENT)
 #include "drivers/DigitalOut.h"
 #include "drivers/Timer.h"
 #include "WizFi360/WizFi360.h"
 #include "events/EventQueue.h"
 #include "events/mbed_shared_queues.h"
-#include "features/netsocket/NetworkInterface.h"
-#include "features/netsocket/NetworkStack.h"
-#include "features/netsocket/nsapi_types.h"
-#include "features/netsocket/SocketAddress.h"
-#include "features/netsocket/WiFiAccessPoint.h"
-#include "features/netsocket/WiFiInterface.h"
+#include "netsocket/NetworkInterface.h"
+#include "netsocket/NetworkStack.h"
+#include "netsocket/nsapi_types.h"
+#include "netsocket/SocketAddress.h"
+#include "netsocket/WiFiAccessPoint.h"
+#include "netsocket/WiFiInterface.h"
 #include "platform/Callback.h"
+#include "platform/mbed_chrono.h"
+#if MBED_CONF_RTOS_PRESENT
 #include "rtos/ConditionVariable.h"
+#endif
 #include "rtos/Mutex.h"
 
 #define WIZFI360_SOCKET_COUNT 5
 
-#define WIZFI360_INTERFACE_CONNECT_INTERVAL_MS (5000)
-#define WIZFI360_INTERFACE_CONNECT_TIMEOUT_MS (2 * WIZFI360_CONNECT_TIMEOUT + WIZFI360_INTERFACE_CONNECT_INTERVAL_MS)
+#define WIZFI360_INTERFACE_CONNECT_INTERVAL 5s
+#define WIZFI360_INTERFACE_CONNECT_TIMEOUT (2 * WIZFI360_CONNECT_TIMEOUT + WIZFI360_INTERFACE_CONNECT_INTERVAL)
+
 #ifdef TARGET_FF_ARDUINO
 #ifndef MBED_CONF_WIZFI360_TX
 #define MBED_CONF_WIZFI360_TX D1
@@ -60,6 +63,7 @@
 #ifndef MBED_CONF_WIZFI360_CHANNELS
 #define MBED_CONF_WIZFI360_CHANNELS 13
 #endif
+
 /** WizFi360Interface class
  *  Implementation of the NetworkStack for the WizFi360
  */
@@ -78,7 +82,7 @@ public:
      * @param rx        RX pin
      * @param debug     Enable debugging
      */
-    WizFi360Interface(PinName tx, PinName rx, bool debug = false, PinName rts = NC, PinName cts = NC, PinName rst = NC, PinName pwr= NC);
+    WizFi360Interface(PinName tx, PinName rx, bool debug = false, PinName rts = NC, PinName cts = NC, PinName rst = NC, PinName pwr = NC);
 
     /**
      * @brief WizFi360Interface default destructor
@@ -97,6 +101,9 @@ public:
     /** Start the interface
      *
      *  Attempts to connect to a WiFi network.
+     *
+     *  If interface is configured blocking it will timeout after up to
+     *  WIZFI360_INTERFACE_CONNECT_TIMEOUT_MS + WIZFI360_CONNECT_TIMEOUT ms.
      *
      *  @param ssid      Name of the network to connect to
      *  @param pass      Security passphrase to connect to the network
@@ -126,6 +133,12 @@ public:
      */
     virtual int set_channel(uint8_t channel);
 
+    /** @copydoc NetworkInterface::set_network */
+    virtual nsapi_error_t set_network(const SocketAddress &ip_address, const SocketAddress &netmask, const SocketAddress &gateway);
+
+    /** @copydoc NetworkInterface::dhcp */
+    virtual nsapi_error_t set_dhcp(bool dhcp);
+
     /** Stop the interface
      *  @return             0 on success, negative on failure
      */
@@ -134,7 +147,7 @@ public:
     /** Get the internally stored IP address
      *  @return             IP address of the interface or null if not yet connected
      */
-    virtual const char *get_ip_address();
+    virtual nsapi_error_t get_ip_address(SocketAddress *address);
 
     /** Get the internally stored MAC address
      *  @return             MAC address of the interface
@@ -146,6 +159,9 @@ public:
     *  @return         Null-terminated representation of the local gateway
     *                  or null if no network mask has been recieved
     */
+    virtual nsapi_error_t get_gateway(SocketAddress *address);
+
+    MBED_DEPRECATED_SINCE("mbed-os-5.15", "String-based APIs are deprecated")
     virtual const char *get_gateway();
 
     /** Get the local network mask
@@ -153,7 +169,26 @@ public:
      *  @return         Null-terminated representation of the local network mask
      *                  or null if no network mask has been recieved
      */
+    virtual nsapi_error_t get_netmask(SocketAddress *address);
+
+    MBED_DEPRECATED_SINCE("mbed-os-5.15", "String-based APIs are deprecated")
     virtual const char *get_netmask();
+
+    /** Get the current time.
+     *
+     *  @retval          NSAPI_ERROR_UNSUPPORTED if the function is not supported
+     *  @retval          NSAPI_ERROR_OK on success
+     *
+     *  @note wizfi360.sntp-enable must be set to true in mbed_app.json.
+     */
+    nsapi_error_t get_time(std::tm *t);
+
+    /** Get the network interface name
+     *
+     *  @return         Null-terminated representation of the network interface name
+     *                  or null if interface not exists
+     */
+    virtual char *get_interface_name(char *interface_name);
 
     /** Gets the current radio signal strength for active connection
      *
@@ -172,11 +207,10 @@ public:
      *
      * This function will block.
      *
-     * @param  ap       Pointer to allocated array to store discovered AP
-     * @param  count    Size of allocated @a res array, or 0 to only count available AP
-     * @param  timeout  Timeout in milliseconds; 0 for no timeout (Default: 0)
-     * @return          Number of entries in @a, or if @a count was 0 number of available networks, negative on error
-     *                  see @a nsapi_error
+     * @param  ap    Pointer to allocated array to store discovered AP
+     * @param  count Size of allocated @a res array, or 0 to only count available AP
+     * @return       Number of entries in @a, or if @a count was 0 number of available networks, negative on error
+     *               see @a nsapi_error
      */
     virtual int scan(WiFiAccessPoint *res, unsigned count);
 
@@ -192,7 +226,8 @@ public:
      *               see @a nsapi_error
      */
     virtual int scan(WiFiAccessPoint *res, unsigned count, scan_mode mode = SCANMODE_PASSIVE,
-                     unsigned t_max = 0, unsigned t_min = 0);
+                     mbed::chrono::milliseconds_u32 t_max = mbed::chrono::milliseconds_u32(0),
+                     mbed::chrono::milliseconds_u32 t_min = mbed::chrono::milliseconds_u32(0));
 
     /** Translates a hostname to an IP address with specific version
      *
@@ -208,14 +243,25 @@ public:
      *                  version is chosen by the stack (defaults to NSAPI_UNSPEC)
      *  @return         0 on success, negative error code on failure
      */
+#if MBED_CONF_WIZFI360_BUILT_IN_DNS
+    nsapi_error_t gethostbyname(const char *name, SocketAddress *address, nsapi_version_t version, const char *interface_name);
+#else
     using NetworkInterface::gethostbyname;
+#endif
+
+    using NetworkInterface::gethostbyname_async;
+    using NetworkInterface::gethostbyname_async_cancel;
 
     /** Add a domain name server to list of servers to query
      *
      *  @param addr     Destination for the host address
      *  @return         0 on success, negative error code on failure
      */
+#if MBED_CONF_WIZFI360_BUILT_IN_DNS
+    nsapi_error_t add_dns_server(const SocketAddress &address, const char *interface_name);
+#else
     using NetworkInterface::add_dns_server;
+#endif
 
     /** @copydoc NetworkStack::setsockopt
      */
@@ -364,7 +410,7 @@ protected:
 
     /** Set country code
      *
-     *  @param track_ap      if TRUE, use country code used by the AP WIZFI360 is connected to,
+     *  @param track_ap      if TRUE, use country code used by the AP WizFi is connected to,
      *                       otherwise uses country_code always
      *  @param country_code  ISO 3166-1 coded, 2 character alphanumeric country code assumed
      *  @param len           Length of the country code
@@ -376,8 +422,17 @@ protected:
 
 private:
     // AT layer
-    WizFi360 _wizfi360;
+    WizFi360 _wizfi;
     void refresh_conn_state_cb();
+
+    /** Status of software connection
+     */
+    typedef enum wizfi_connection_software_status {
+        IFACE_STATUS_DISCONNECTED = 0,
+        IFACE_STATUS_CONNECTING = 1,
+        IFACE_STATUS_CONNECTED = 2,
+        IFACE_STATUS_DISCONNECTING = 3
+    } wizfi_connection_software_status_t;
 
     // HW reset pin
     class ResetPin {
@@ -401,6 +456,12 @@ private:
         mbed::DigitalOut  _pwr_pin;
     } _pwr_pin;
 
+    /** Assert the reset and power pins
+     *  WizFi360 has two pins serving similar purpose and this function asserts them both
+     *  if they are configured in mbed_app.json.
+     */
+    void _power_off();
+
     // Credentials
     static const int WIZFI360_SSID_MAX_LENGTH = 32; /* 32 is what 802.11 defines as longest possible name */
     char ap_ssid[WIZFI360_SSID_MAX_LENGTH + 1]; /* The longest possible name; +1 for the \0 */
@@ -411,7 +472,7 @@ private:
 
     // Country code
     struct _channel_info {
-        bool track_ap; // Set country code based on the AP WIZFI360 is connected to
+        bool track_ap; // Set country code based on the AP WizFi is connected to
         char country_code[4]; // ISO 3166-1 coded, 2-3 character alphanumeric country code - +1 for the '\0' - assumed. Documentation doesn't tell.
         int channel_start;
         int channels;
@@ -419,7 +480,9 @@ private:
     struct _channel_info _ch_info;
 
     bool _if_blocking; // NetworkInterface, blocking or not
+#if MBED_CONF_RTOS_PRESENT
     rtos::ConditionVariable _if_connected;
+#endif
 
     // connect status reporting
     nsapi_error_t _conn_status_to_error();
@@ -435,6 +498,7 @@ private:
     // Driver's state
     int _initialized;
     nsapi_error_t _connect_retval;
+    nsapi_error_t _disconnect_retval;
     bool _get_firmware_ok();
     nsapi_error_t _init(void);
     nsapi_error_t _reset();
@@ -457,10 +521,14 @@ private:
     events::EventQueue *_global_event_queue;
     int _oob_event_id;
     int _connect_event_id;
+    int _disconnect_event_id;
     void proc_oob_evnt();
     void _connect_async();
+    void _disconnect_async();
     rtos::Mutex _cmutex; // Protect asynchronous connection logic
+    wizfi_connection_software_status_t _software_conn_stat;
+    bool _dhcp;
 
 };
 #endif
-#endif
+#endif  /* WIZFI360_INTERFACE_H */
