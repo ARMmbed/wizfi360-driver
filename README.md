@@ -15,4 +15,4 @@ You can use the default Wi-Fi driver in the mbed-os.
 
 - Add WizFi360 Wi-Fi driver to path below
 
-> project directory → mbed-os → connectivity → drivers → wifi → **wizfi360-driver**
+> Project directory → mbed-os → connectivity → drivers → wifi → **wizfi360-driver**
